@@ -10,7 +10,6 @@ import os.path
 import subprocess
 import logging
 import time
-import pprint
 
 from utils.image import Image
 from utils.common import get_hash
@@ -68,27 +67,24 @@ class Worker(threading.Thread):
         self.log.info("config initialized")
         self.database = Database(self.config)
         self.log.info("database initialized")
+        self.params = {}
 
     def setup_meta(self):
         self.log.debug("setup meta")
-        os.makedirs(self.location, exist_ok=True)
-        if not os.path.exists(self.location + "/meta"):
-            cmdline = "git clone https://github.com/aparcar/meta-imagebuilder.git ."
-            proc = subprocess.Popen(
-                cmdline.split(" "),
-                cwd=self.location,
-                stdout=subprocess.PIPE,
-                shell=False,
-            )
+        cmdline = "git clone https://github.com/aparcar/meta-imagebuilder.git .".split(" ")
+        if self.local:
+            os.makedirs(self.location, exist_ok=True)
+            if not os.path.exists(self.location + "/meta"):
+                return_code, stdout, stderr = self.run_cmd(cmdline)
+        else:
+            if not self.rexists("meta"):
+                return_code, stdout, stderr = self.run_cmd(cmdline)
 
-            _, errors = proc.communicate()
-            return_code = proc.returncode
-
-            if return_code != 0:
-                self.log.error("failed to setup meta ImageBuilder")
-                exit()
-
-        self.log.info("meta ImageBuilder successfully setup")
+        if return_code != 0:
+            self.log.error("failed to setup meta ImageBuilder:\n%s", stderr)
+            exit()
+        else:
+            self.log.info("meta ImageBuilder successfully setup")
 
     def write_log(self, path, stdout=None, stderr=None):
         with open(path, "a") as log_file:
@@ -111,7 +107,7 @@ class Worker(threading.Thread):
         self.image = Image(self.params)
 
         # first determine the resulting manifest hash
-        return_code, manifest_content, errors = self.run_meta("manifest")
+        return_code, manifest_content, errors = self.run_cmd("manifest")
 
         if return_code == 0:
             self.image.params["manifest_hash"] = get_hash(manifest_content, 15)
@@ -163,7 +159,7 @@ class Worker(threading.Thread):
             self.params["NO_DOWNLOAD"] = "1"
 
             build_start = time.time()
-            return_code, buildlog, errors = self.run_meta("image")
+            return_code, buildlog, errors = self.run_cmd("image")
             self.image.params["build_seconds"] = int(time.time() - build_start)
 
             if return_code == 0:
@@ -226,6 +222,8 @@ class Worker(threading.Thread):
 
         while True:
             self.params = self.queue.get()
+            self.params.pop("id")
+            self.params.pop("image_hash")
             self.version_config = self.config.version(
                     self.params["distro"], self.params["version"])
             if self.job == "image":
@@ -245,15 +243,17 @@ class Worker(threading.Thread):
             self.log.info("%s target is supported", self.params["target"])
             self.database.insert_supported(self.params)
 
-    def run_meta(self, cmd):
-        cmdline = ["sh", "meta", cmd ]
+    def run_cmd(self, cmd, meta=True):
+        if meta:
+            cmd = ["sh", "meta", cmd]
         if self.local:
-            return_code, stdout, stderr = self.run_local(cmdline)
+            return_code, stdout, stderr = self.run_local(cmd)
+            output = stdout.decode('utf-8')
+            errors = stderr.decode('utf-8')
         else:
-            return_code, stdout, stderr = self.run_remote(cmdline)
-
-        output = stdout.decode('utf-8')
-        errors = stderr.decode('utf-8')
+            return_code, stdout, stderr = self.run_remote(cmd)
+            output = stdout.read()
+            errors = stderr.read()
 
         return (return_code, output, errors)
 
@@ -274,7 +274,8 @@ class Worker(threading.Thread):
     def sftp_setup(self):
         username, hostname, port = self.ssh_login_data()
         t = paramiko.Transport((hostname, port))
-        t.connect(username=username)
+        pk = paramiko.RSAKey.from_private_key(open('~/.ssh/id_rsa')) # TODO is that a clean solution?
+        t.connect(username=username, pkey=pk)
         self.sftp = paramiko.SFTPClient.from_transport(t)
 
     def copy_from_remote(self):
@@ -282,6 +283,14 @@ class Worker(threading.Thread):
         for remote_file in self.sftp.listdir(self.build_dir):
             self.sftp.get(self.build_dir + "/" + remote_file ,
                     self.image.params["dir"])
+
+    def rexists(self, path):
+        try:
+            self.sftp.stat(path)
+        except IOError as e:
+            return False
+        else:
+            return True
 
     # parses worker address, username and port
     def ssh_login_data(self):
@@ -294,20 +303,18 @@ class Worker(threading.Thread):
         if ":" in hostname:
             hostname, port = hostname.split(":")
 
-        return (username, hostname, port)
+        return (username, hostname, int(port))
 
     def run_remote(self, cmdline):
         username, hostname, port = self.ssh_login_data()
-        try:
-            client = paramiko.SSHClient()
-            client.load_system_host_keys()
-            client.set_missing_host_key_policy(paramiko.WarningPolicy)
-            client.connect(hostname, port=port, username=username)
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname, port=port, username=username, key_filename="~/.ssh/id_rsa") # TODO ?!
 
-            stdin, stdout, stderr = client.exec_command(command, environment=self.params)
+        stdin, stdout, stderr = client.exec_command(" ".join(cmdline), environment=self.params)
 
-        finally:
-            client.close()
+        client.close()
 
         return (0, stdout, stderr)
 
@@ -339,7 +346,7 @@ class Worker(threading.Thread):
     def parse_info(self):
         self.log.debug("parse info")
 
-        return_code, output, errors = self.run_meta("info")
+        return_code, output, errors = self.run_cmd("info")
 
         if return_code == 0:
             default_packages_pattern = r"(.*\n)*Default Packages: (.+)\n"
@@ -363,7 +370,7 @@ class Worker(threading.Thread):
     def parse_packages(self):
         self.log.info("receive packages")
 
-        return_code, output, errors = self.run_meta("package_list")
+        return_code, output, errors = self.run_cmd("package_list")
 
         if return_code == 0:
             packages = re.findall(r"(.+?) - (.+?) - .*\n", output)
@@ -383,6 +390,7 @@ class Updater(threading.Thread):
         self.config = Config()
         self.database = Database(self.config)
         self.update_queue = Queue(1)
+        self.params = {}
 
     def run(self):
         location = self.config.get("updater_dir", "./updater")
@@ -433,7 +441,7 @@ if __name__ == '__main__':
     log = logging.getLogger(__name__)
     log.info("start garbage collector")
     gaco = GarbageCollector()
-    gaco.start()
+    #gaco.start()
 
     log.info("start boss")
     boss = Boss()
@@ -441,7 +449,7 @@ if __name__ == '__main__':
 
     log.info("start updater")
     uper = Updater()
-    uper.start()
+    #uper.start()
 
     # TODO reimplement
     #def diff_packages(self):
